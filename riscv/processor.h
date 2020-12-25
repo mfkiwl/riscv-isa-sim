@@ -85,10 +85,6 @@ typedef struct
   bool load;
 } mcontrol_t;
 
-inline reg_t BITS(reg_t v, int hi, int lo){
-  return (v >> lo) & ((2 << (hi - lo)) - 1);
-}
-
 enum VRM{
   RNU = 0,
   RNE,
@@ -164,6 +160,7 @@ struct state_t
 
   // control and status registers
   reg_t prv;    // TODO: Can this be an enum instead?
+  bool v;
   reg_t misa;
   reg_t mstatus;
   reg_t mepc;
@@ -184,6 +181,23 @@ struct state_t
   reg_t stvec;
   reg_t satp;
   reg_t scause;
+
+  reg_t mtval2;
+  reg_t mtinst;
+  reg_t hstatus;
+  reg_t hideleg;
+  reg_t hedeleg;
+  uint32_t hcounteren;
+  reg_t htval;
+  reg_t htinst;
+  reg_t hgatp;
+  reg_t vsstatus;
+  reg_t vstvec;
+  reg_t vsscratch;
+  reg_t vsepc;
+  reg_t vscause;
+  reg_t vstval;
+  reg_t vsatp;
 
   reg_t dpc;
   reg_t dscratch0, dscratch1;
@@ -228,11 +242,16 @@ typedef enum {
 typedef enum {
   // 65('A') ~ 90('Z') is reserved for standard isa in misa
   EXT_ZFH   = 0,
-  EXT_ZVAMO,
   EXT_ZVEDIV,
-  EXT_ZVLSSEG,
-  EXT_ZVQMAC,
 } isa_extension_t;
+
+typedef enum {
+  IMPL_MMU_SV32,
+  IMPL_MMU_SV39,
+  IMPL_MMU_SV48,
+  IMPL_MMU_SBARE,
+  IMPL_MMU,
+} impl_extension_t;
 
 // Count number of contiguous 1 bits starting from the LSB.
 static int cto(reg_t val)
@@ -261,7 +280,9 @@ public:
   void reset();
   void step(size_t n); // run for n cycles
   void set_csr(int which, reg_t val);
-  reg_t get_csr(int which);
+  uint32_t get_id() const { return id; }
+  reg_t get_csr(int which, insn_t insn, bool write, bool peek = 0);
+  reg_t get_csr(int which) { return get_csr(which, insn_t(0), false, true); }
   mmu_t* get_mmu() { return mmu; }
   state_t* get_state() { return &state; }
   unsigned get_xlen() { return xlen; }
@@ -274,20 +295,25 @@ public:
   }
   extension_t* get_extension() { return ext; }
   bool supports_extension(unsigned char ext) {
-    if (isupper(ext))
+    if (ext >= 'A' && ext <= 'Z')
       return ((state.misa >> (ext - 'A')) & 1);
     else
       return extension_table[ext];
+  }
+  void set_impl(uint8_t impl, bool val) { impl_table[impl] = val; }
+  bool supports_impl(uint8_t impl) const {
+    return impl_table[impl];
   }
   reg_t pc_alignment_mask() {
     return ~(reg_t)(supports_extension('C') ? 0 : 2);
   }
   void check_pc_alignment(reg_t pc) {
     if (unlikely(pc & ~pc_alignment_mask()))
-      throw trap_instruction_address_misaligned(pc);
+      throw trap_instruction_address_misaligned(pc, 0, 0);
   }
   reg_t legalize_privilege(reg_t);
   void set_privilege(reg_t);
+  void set_virt(bool);
   void update_histogram(reg_t pc);
   const disassembler_t* get_disassembler() { return disassembler; }
 
@@ -305,7 +331,11 @@ public:
   // When true, take the slow simulation path.
   bool slow_path();
   bool halted() { return state.debug_mode; }
-  bool halt_request;
+  enum {
+    HR_NONE,    /* Halt request is inactive. */
+    HR_REGULAR, /* Regular halt request/debug interrupt. */
+    HR_GROUP    /* Halt requested due to halt group. */
+  } halt_request;
 
   // Return the index of a trigger that matched, or -1.
   inline int trigger_match(trigger_operation_t operation, reg_t address, reg_t data)
@@ -391,6 +421,9 @@ public:
 
   void set_pmp_num(reg_t pmp_num);
   void set_pmp_granularity(reg_t pmp_granularity);
+  void set_mmu_capability(int cap);
+
+  const char* get_symbol(uint64_t addr);
 
 private:
   simif_t* sim;
@@ -408,6 +441,7 @@ private:
   FILE *log_file;
   bool halt_on_reset;
   std::vector<bool> extension_table;
+  std::vector<bool> impl_table;
   
 
   std::vector<insn_desc_t> instructions;
@@ -436,6 +470,7 @@ private:
   void build_opcode_map();
   void register_base_instructions();
   insn_func_t decode_insn(insn_t insn);
+  reg_t cal_satp(reg_t val) const;
 
   // Track repeated executions for processor_t::disasm()
   uint64_t last_pc, last_bits, executions;
@@ -449,11 +484,14 @@ public:
       void *reg_file;
       char reg_referenced[NVPR];
       int setvl_count;
-      reg_t reg_mask, vlmax, vmlen;
+      reg_t vlmax;
       reg_t vstart, vxrm, vxsat, vl, vtype, vlenb;
-      reg_t vediv, vsew, vlmul;
-      reg_t ELEN, VLEN, SLEN;
+      reg_t vma, vta;
+      reg_t vediv, vsew;
+      float vflmul;
+      reg_t ELEN, VLEN;
       bool vill;
+      bool vstart_alu;
 
       // vector element for varies SEW
       template<class T>
@@ -472,7 +510,7 @@ public:
 
 #ifdef RISCV_ENABLE_COMMITLOG
           if (is_write)
-            p->get_state()->log_reg_write[((vReg) << 2) | 2] = {0, 0};
+            p->get_state()->log_reg_write[((vReg) << 4) | 2] = {0, 0};
 #endif
 
           T *regStart = (T*)((char*)reg_file + vReg * (VLEN >> 3));
@@ -495,7 +533,7 @@ public:
 
       reg_t get_vlen() { return VLEN; }
       reg_t get_elen() { return ELEN; }
-      reg_t get_slen() { return SLEN; }
+      reg_t get_slen() { return VLEN; }
 
       VRM get_vround_mode() {
         return (VRM)vxrm;
